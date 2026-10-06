@@ -6,6 +6,7 @@ import time
 
 import av
 from av.codec.hwaccel import HWAccel
+from av.datasets import curated
 
 SAMPLE = "pexels/time-lapse-video-of-night-sky-857195.mp4"
 MAX_FRAMES = 180
@@ -83,7 +84,7 @@ def median(rows, key):
 
 
 def main():
-    path = av.datasets.curated(SAMPLE)
+    path = curated(SAMPLE)
 
     # Warm-up: initialize decoder/device and touch the sample once.
     warm = run_decode(path, "retained", 12)

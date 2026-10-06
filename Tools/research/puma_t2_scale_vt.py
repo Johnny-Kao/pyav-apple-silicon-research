@@ -19,12 +19,7 @@ def pctl(values, q):
 def make_scale_graph(frame, out_w, out_h):
     device = HWDevice("videotoolbox")
     graph = av.filter.Graph(hw_device=device)
-    src = graph.add_buffer(
-        width=frame.width,
-        height=frame.height,
-        format=frame.format,
-        time_base=frame.time_base,
-    )
+    src = graph.add_buffer(template=frame)
     scale = graph.add("scale_vt", f"w={out_w}:h={out_h}")
     sink = graph.add("buffersink")
     graph.link_nodes(src, scale, sink).configure()

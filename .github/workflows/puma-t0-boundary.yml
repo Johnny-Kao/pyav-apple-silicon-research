@@ -1,0 +1,67 @@
+name: PUMA T0 Unified-Memory Boundary
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  boundary:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Checkout research snapshot
+        uses: actions/checkout@v4
+
+      - name: Environment fingerprint
+        run: |
+          echo "repo_sha=$GITHUB_SHA"
+          uname -m
+          sw_vers
+          sysctl -n hw.model || true
+
+      - name: Build boundary benchmark
+        run: |
+          clang -O3 -fobjc-arc \
+            -framework Foundation \
+            -framework Metal \
+            -framework CoreVideo \
+            Tools/research/puma_t0_boundary_bench.m \
+            -o /tmp/puma_t0_boundary
+
+      - name: Run boundary benchmark
+        run: |
+          /tmp/puma_t0_boundary > /tmp/puma_t0_boundary.json
+          cat /tmp/puma_t0_boundary.json
+
+      - name: Decision summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          out = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          p = Path("/tmp/puma_t0_boundary.json")
+          with out.open("a") as f:
+              f.write("## PUMA T0 — unified-memory boundary\n\n")
+              f.write(f"- research commit: {os.environ['GITHUB_SHA']}\n")
+              if p.exists() and p.stat().st_size:
+                  data = json.loads(p.read_text())
+                  f.write(f"- Metal device: {data['metal_device']}\n\n")
+                  f.write("| frame | CPU copy/reuse | CPU alloc+copy | Metal view | copy/map | alloc+copy/map |\n")
+                  f.write("|---|---:|---:|---:|---:|---:|\n")
+                  for c in data["cases"]:
+                      label = f"{c['width']}x{c['height']}"
+                      f.write(
+                          f"| {label} | {c['copy_reuse_median_us']:.1f} us | "
+                          f"{c['copy_alloc_median_us']:.1f} us | "
+                          f"{c['metal_map_median_us']:.1f} us | "
+                          f"{c['copy_reuse_over_map']:.1f}x | "
+                          f"{c['copy_alloc_over_map']:.1f}x |\n"
+                      )
+              else:
+                  f.write("- result: NOT EXECUTED\n")
+          PY

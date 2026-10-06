@@ -1,0 +1,155 @@
+name: PUMA T3 Bulk Luma Reduction
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: "Research dispatch marker"
+        required: false
+        default: "t3-bulk-luma"
+  push:
+    branches:
+      - research/puma-bulk-luma-reduction
+    paths:
+      - "Tools/research/puma_t3_bulk_luma.py"
+      - "Tools/research/puma_metal_bridge.m"
+      - "av/video/frame.py"
+      - ".github/workflows/puma-t3-bulk-luma.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  bulk-luma:
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout research branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Environment fingerprint
+        run: |
+          echo "repo_sha=$GITHUB_SHA"
+          uname -a
+          uname -m
+          sw_vers
+          xcrun --show-sdk-version
+          system_profiler SPHardwareDataType || true
+
+      - name: Install FFmpeg and build dependencies
+        run: |
+          if ! command -v pkg-config >/dev/null 2>&1; then
+            brew install pkg-config
+          fi
+          if ! pkg-config --exists libavformat 2>/dev/null; then
+            brew install ffmpeg
+          fi
+          python -m pip install --upgrade pip
+          python -m pip install "cython>=3.3,<4" setuptools wheel numpy
+
+      - name: Build research PyAV
+        run: |
+          export PKG_CONFIG_PATH="$(brew --prefix ffmpeg)/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          python -m pip uninstall -y av || true
+          python -m pip install --no-build-isolation .
+          cd /tmp
+          python - <<'PY'
+          import av
+          from av.codec.hwaccel import hwdevices_available
+          print("pyav_version=", av.__version__)
+          print("hwdevices=", hwdevices_available())
+          assert "videotoolbox" in hwdevices_available()
+          assert hasattr(av.VideoFrame, "_research_videotoolbox_pixel_buffer_address")
+          PY
+
+      - name: Build Metal reduction bridge
+        run: |
+          EXT_SUFFIX="$(python - <<'PY'
+          import sysconfig
+          print(sysconfig.get_config_var("EXT_SUFFIX"))
+          PY
+          )"
+          clang -O3 -bundle -undefined dynamic_lookup -fobjc-arc \
+            $(python3-config --includes) \
+            -framework Foundation \
+            -framework Metal \
+            -framework CoreVideo \
+            -framework IOSurface \
+            Tools/research/puma_metal_bridge.m \
+            -o "/tmp/puma_metal_bridge${EXT_SUFFIX}"
+          cd /tmp
+          python - <<'PY'
+          import puma_metal_bridge
+          print("metal_device=", puma_metal_bridge.device_name())
+          assert hasattr(puma_metal_bridge, "sum_luma_gpu")
+          PY
+
+      - name: Generate controlled H.264 clips
+        run: |
+          make_clip() {
+            local size="$1"
+            local frames="$2"
+            local bitrate="$3"
+            local out="$4"
+            if ffmpeg -hide_banner -loglevel error -y \
+              -f lavfi -i "testsrc2=size=${size}:rate=60" \
+              -frames:v "$frames" -an -pix_fmt nv12 \
+              -c:v h264_videotoolbox -b:v "$bitrate" -g 60 -bf 0 "$out"; then
+              echo "generated $out with h264_videotoolbox"
+            else
+              ffmpeg -hide_banner -loglevel error -y \
+                -f lavfi -i "testsrc2=size=${size}:rate=60" \
+                -frames:v "$frames" -an \
+                -c:v libx264 -preset ultrafast -tune zerolatency -g 60 -bf 0 "$out"
+            fi
+          }
+          make_clip 1920x1080 120 12M /tmp/puma1080.mp4
+          make_clip 3840x2160 90 35M /tmp/puma4k.mp4
+
+      - name: Run whole-frame reduction decision batch
+        run: |
+          cd /tmp
+          PYTHONPATH=/tmp python "$GITHUB_WORKSPACE/Tools/research/puma_t3_bulk_luma.py" \
+            /tmp/puma1080.mp4 /tmp/puma4k.mp4 \
+            --frames-1080 90 --frames-4k 60 \
+            > /tmp/puma_t3_bulk_luma.json
+          cat /tmp/puma_t3_bulk_luma.json
+
+      - name: Decision summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          p = Path("/tmp/puma_t3_bulk_luma.json")
+          out = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with out.open("a") as f:
+              f.write("## PUMA T3 — whole-frame luma reduction\n\n")
+              f.write(f"- research commit: {os.environ['GITHUB_SHA']}\n")
+              if not (p.exists() and p.stat().st_size):
+                  f.write("- result: NOT EXECUTED / failed before JSON output\n")
+              else:
+                  data = json.loads(p.read_text())
+                  f.write("| frame | exact sum | Metal full-frame | NumPy download+sum | operation speedup | loop wall speedup | CPU reduction |\n")
+                  f.write("|---|---|---:|---:|---:|---:|---:|\n")
+                  for case in data["cases"]:
+                      c = case["capability"]
+                      s = case["summary"]
+                      label = f"{s['width']}x{s['height']}"
+                      f.write(
+                          f"| {label} | {c['equal']} | "
+                          f"{s['metal_median_us']:.2f} us | "
+                          f"{s['numpy_median_us']:.2f} us | "
+                          f"{s['operation_speedup']:.2f}x | "
+                          f"{s['loop_wall_speedup']:.2f}x | "
+                          f"{s['cpu_time_reduction']:.2f}x |\n"
+                      )
+          PY

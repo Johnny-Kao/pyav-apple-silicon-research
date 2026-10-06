@@ -1,0 +1,129 @@
+name: PUMA T4 4K Hardware Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: "Research dispatch marker"
+        required: false
+        default: "t4-4k-pipeline"
+  push:
+    branches:
+      - research/puma-4k-hw-pipeline
+    paths:
+      - "Tools/research/puma_t4_4k_pipeline.py"
+      - "av/**"
+      - ".github/workflows/puma-t4-4k-pipeline.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  pipeline:
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout research branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Environment fingerprint
+        run: |
+          echo "repo_sha=$GITHUB_SHA"
+          uname -a
+          uname -m
+          sw_vers
+          xcrun --show-sdk-version
+          system_profiler SPHardwareDataType || true
+
+      - name: Install FFmpeg and build dependencies
+        run: |
+          if ! command -v pkg-config >/dev/null 2>&1; then
+            brew install pkg-config
+          fi
+          if ! pkg-config --exists libavformat 2>/dev/null; then
+            brew install ffmpeg
+          fi
+          ffmpeg -hide_banner -filters | grep scale_vt || true
+          python -m pip install --upgrade pip
+          python -m pip install "cython>=3.3,<4" setuptools wheel numpy
+
+      - name: Build research PyAV
+        run: |
+          export PKG_CONFIG_PATH="$(brew --prefix ffmpeg)/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          python -m pip uninstall -y av || true
+          python -m pip install --no-build-isolation .
+          cd /tmp
+          python - <<'PY'
+          import av
+          from av.codec.hwaccel import hwdevices_available
+          print("pyav_version=", av.__version__)
+          print("hwdevices=", hwdevices_available())
+          print("scale_vt_filter=", av.filter.Filter("scale_vt"))
+          assert "videotoolbox" in hwdevices_available()
+          PY
+
+      - name: Generate controlled 4K H.264 input
+        run: |
+          if ffmpeg -hide_banner -loglevel error -y \
+            -f lavfi -i "testsrc2=size=3840x2160:rate=60" \
+            -frames:v 120 -an -pix_fmt nv12 \
+            -c:v h264_videotoolbox -b:v 35M -g 60 -bf 0 /tmp/puma4k.mp4; then
+            echo "generated with h264_videotoolbox"
+          else
+            ffmpeg -hide_banner -loglevel error -y \
+              -f lavfi -i "testsrc2=size=3840x2160:rate=60" \
+              -frames:v 120 -an \
+              -c:v libx264 -preset ultrafast -tune zerolatency -g 60 -bf 0 /tmp/puma4k.mp4
+          fi
+
+      - name: Run hardware-resident pipeline comparison
+        run: |
+          cd /tmp
+          python "$GITHUB_WORKSPACE/Tools/research/puma_t4_4k_pipeline.py" \
+            /tmp/puma4k.mp4 \
+            --out-width 1920 --out-height 1080 \
+            --frames 90 --rate 60 \
+            > /tmp/puma_t4_4k_pipeline.json
+          cat /tmp/puma_t4_4k_pipeline.json
+
+      - name: Decision summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          p = Path("/tmp/puma_t4_4k_pipeline.json")
+          out = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with out.open("a") as f:
+              f.write("## PUMA T4 — 4K hardware-resident transcode\n\n")
+              f.write(f"- research commit: {os.environ['GITHUB_SHA']}\n")
+              if not (p.exists() and p.stat().st_size):
+                  f.write("- result: NOT EXECUTED / failed before JSON output\n")
+              else:
+                  data = json.loads(p.read_text())
+                  s = data["summary"]
+                  f.write("| metric | candidate | baseline | ratio |\n")
+                  f.write("|---|---:|---:|---:|\n")
+                  f.write(
+                      f"| per-frame pipeline operation | {s['candidate_operation_us']:.1f} us | "
+                      f"{s['baseline_operation_us']:.1f} us | {s['operation_speedup']:.2f}x |\n"
+                  )
+                  f.write(
+                      f"| end-to-end wall | {s['candidate_wall_ms_per_frame']:.2f} ms/frame | "
+                      f"{s['baseline_wall_ms_per_frame']:.2f} ms/frame | "
+                      f"{s['end_to_end_wall_speedup']:.2f}x |\n"
+                  )
+                  f.write(
+                      f"| CPU time | {s['candidate_cpu_ms_per_frame']:.2f} ms/frame | "
+                      f"{s['baseline_cpu_ms_per_frame']:.2f} ms/frame | "
+                      f"{s['cpu_time_reduction']:.2f}x |\n"
+                  )
+          PY

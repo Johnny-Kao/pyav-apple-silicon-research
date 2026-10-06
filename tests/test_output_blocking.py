@@ -1,0 +1,264 @@
+import socket
+import threading
+import time
+
+import numpy as np
+import pytest
+
+import av
+
+from .common import TestCase
+
+WINDOW = 1.0
+HANDSHAKE_TIMEOUT = 10.0
+MAX_FRAMES = 500
+
+
+class SilentServer:
+    def __init__(self) -> None:
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(4)
+        # Poll rather than block, so close() can stop the thread itself.
+        # Closing the socket under a blocked accept() is not guaranteed to
+        # wake it, and a thread still sitting in accept() outlives the test.
+        self.sock.settimeout(0.1)
+        self.port: int = self.sock.getsockname()[1]
+        self.accepted: list[socket.socket] = []
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self._accept, daemon=True)
+        self.thread.start()
+
+    def _accept(self) -> None:
+        while not self.stopped.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            self.accepted.append(conn)
+
+    def close(self) -> None:
+        self.stopped.set()
+        self.thread.join(WINDOW)
+        assert not self.thread.is_alive(), "the accept thread outlived the server"
+        self.sock.close()
+        for conn in self.accepted:
+            conn.close()
+
+
+def has_rtmp() -> bool:
+    """Whether FFmpeg was built with the RTMP protocol.
+
+    Port 1 on loopback refuses at once, so the probe either fails looking the
+    protocol up, before any connect, or fails connecting.
+    """
+    try:
+        with av.open("rtmp://127.0.0.1:1/x", "w", format="flv", timeout=1) as container:
+            container.start_encoding()
+    except av.error.ProtocolNotFoundError:
+        return False
+    except Exception:
+        pass
+    return True
+
+
+@pytest.mark.skipif(not has_rtmp(), reason="FFmpeg was built without RTMP")
+class TestOutputBlocking(TestCase):
+    def setUp(self) -> None:
+        self.server = SilentServer()
+
+    def tearDown(self) -> None:
+        self.server.close()
+
+    def _push(
+        self, timeout: float, containers: list | None = None
+    ) -> tuple[threading.Thread, list[BaseException]]:
+        raised: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                container = av.open(
+                    f"rtmp://127.0.0.1:{self.server.port}/live/x",
+                    "w",
+                    format="flv",
+                    timeout=timeout,
+                )
+                if containers is not None:
+                    containers.append(container)
+                stream = container.add_stream("h264", rate=30)
+                stream.width = 320
+                stream.height = 240
+                stream.pix_fmt = "yuv420p"
+                container.start_encoding()
+            except BaseException as e:
+                raised.append(e)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return thread, raised
+
+    def test_start_encoding_releases_the_gil(self) -> None:
+        start = time.monotonic()
+        thread, _ = self._push(HANDSHAKE_TIMEOUT)
+
+        deadline = start + HANDSHAKE_TIMEOUT
+        while not self.server.accepted and time.monotonic() < deadline:
+            time.sleep(0.001)
+        elapsed = time.monotonic() - start
+
+        assert self.server.accepted, (
+            f"no connection was seen for {elapsed:.1f}s: the handshake held the "
+            "GIL, or never connected"
+        )
+        assert thread.is_alive(), "the handshake ended before anything else could run"
+        assert elapsed < HANDSHAKE_TIMEOUT / 2, f"nothing else ran for {elapsed:.1f}s"
+
+        # Hanging up ends the handshake, so passing does not cost the timeout.
+        for conn in self.server.accepted:
+            conn.close()
+        thread.join(HANDSHAKE_TIMEOUT)
+        assert not thread.is_alive(), "hanging up did not end the handshake"
+
+    def test_start_encoding_honours_the_timeout(self) -> None:
+        thread, raised = self._push(WINDOW)
+        thread.join(WINDOW * 8)
+        assert not thread.is_alive(), "timeout did not interrupt the handshake"
+        assert raised, "the handshake returned instead of timing out"
+
+    def test_close_refuses_to_free_a_container_in_use(self) -> None:
+        containers: list[av.container.OutputContainer] = []
+        thread, _ = self._push(WINDOW * 2, containers)
+
+        # The server only accepts once the writing thread is inside the
+        # connect, which is where the context stops being ours to free.
+        deadline = time.monotonic() + WINDOW
+        while not self.server.accepted and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert self.server.accepted, "the writing thread never connected"
+
+        with pytest.raises(RuntimeError, match="another thread"):
+            containers[0].close()
+        thread.join(WINDOW * 8)
+
+
+class TestFailedHeaderWrite(TestCase):
+    def test_a_failed_header_write_closes_the_connection(self) -> None:
+        """mp4 cannot carry PCM, so the muxer rejects it after the connect."""
+        server = SilentServer()
+        self.addCleanup(server.close)
+
+        container = av.open(f"tcp://127.0.0.1:{server.port}", "w", format="mp4")
+        container.add_stream("pcm_s16le")
+        with pytest.raises(av.error.ArgumentError):
+            container.start_encoding()
+
+        deadline = time.monotonic() + WINDOW
+        while not server.accepted and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert server.accepted, "the writer never connected"
+
+        # started was never set, so nothing downstream would close pb.
+        conn = server.accepted[0]
+        conn.settimeout(WINDOW)
+        try:
+            while conn.recv(4096):
+                pass  # Drain whatever the muxer wrote before it gave up.
+        except TimeoutError:
+            raise AssertionError("the connection was left open") from None
+
+
+class TestOutputWriteTimeout(TestCase):
+    """Muxing and closing over a peer that has stopped reading."""
+
+    def setUp(self) -> None:
+        self.server = SilentServer()
+
+    def tearDown(self) -> None:
+        self.server.close()
+
+    def _open(self) -> av.container.OutputContainer:
+        container = av.open(
+            f"tcp://127.0.0.1:{self.server.port}",
+            "w",
+            format="mpegts",
+            timeout=WINDOW,
+        )
+        # Closing from __del__ instead would write the trailer at collection
+        # time, where the failure surfaces as an unraisable exception.
+        self.addCleanup(self._close_quietly, container)
+        stream = container.add_stream("mpeg4", rate=30)
+        stream.width = 640
+        stream.height = 480
+        stream.pix_fmt = "yuv420p"
+        return container
+
+    @staticmethod
+    def _close_quietly(container: av.container.OutputContainer) -> None:
+        try:
+            container.close()
+        except av.error.ExitError:
+            pass  # A stalled write is the point of these tests.
+
+    def _fill(self, container: av.container.OutputContainer) -> None:
+        """Mux noise, which compresses badly, until the socket blocks."""
+        stream = container.streams.video[0]
+        rgb = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
+        frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+        for i in range(MAX_FRAMES):
+            frame.pts = i
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        raise AssertionError("the socket swallowed everything without blocking")
+
+    def test_mux_honours_the_timeout(self) -> None:
+        container = self._open()
+        start = time.monotonic()
+        with pytest.raises(av.error.ExitError):
+            self._fill(container)
+        assert time.monotonic() - start >= WINDOW, "the write gave up early"
+
+    def test_close_frees_the_container_after_a_stalled_write(self) -> None:
+        container = self._open()
+        with pytest.raises(av.error.ExitError):
+            self._fill(container)
+
+        # A timed-out write leaves its error on the AVIO context, so the
+        # trailer fails straight away rather than blocking. That makes this a
+        # test of the teardown, not of the close timeout: close() must report
+        # the failure and still free the context.
+        with pytest.raises(av.error.ExitError):
+            container.close()
+        with pytest.raises(AssertionError, match="not open"):
+            container.add_stream("mpeg4", rate=30)
+
+
+class TestSeekableOutputIgnoresTheTimeout(TestCase):
+    """A local file is written on its own schedule, not a peer's."""
+
+    def test_faststart_close_is_not_cut_short(self) -> None:
+        path = self.sandboxed("faststart.mp4")
+        with av.open(
+            path,
+            "w",
+            timeout=(None, 1e-9),
+            container_options={"movflags": "faststart"},
+        ) as container:
+            stream = container.add_stream("mpeg4", rate=30)
+            stream.width = 640
+            stream.height = 480
+            stream.pix_fmt = "yuv420p"
+            rgb = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
+            frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+            for i in range(120):
+                frame.pts = i
+                for packet in stream.encode(frame):
+                    container.mux(packet)
+            for packet in stream.encode():
+                container.mux(packet)
+
+        with av.open(path) as container:
+            assert sum(1 for _ in container.decode(video=0)) == 120

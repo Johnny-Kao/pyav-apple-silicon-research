@@ -1,0 +1,232 @@
+name: smoke
+on:
+  workflow_dispatch:
+  push:
+    branches: master
+    paths-ignore:
+      - '**.md'
+      - '**.rst'
+      - '**.txt'
+      - '.github/workflows/tests.yml'
+  pull_request:
+    branches: master
+    paths-ignore:
+      - '**.md'
+      - '**.rst'
+      - '**.txt'
+      - '.github/workflows/tests.yml'
+jobs:
+  style:
+    runs-on: ubuntu-slim
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Python
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          activate-environment: true
+          python-version: "3.14"
+      - name: Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "stable"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Linters
+        run: make lint
+      - name: pxdpad
+        run: make pxdpad
+
+  nix:
+    name: "py-${{ matrix.config.python }} lib-${{ matrix.config.ffmpeg }} ${{matrix.config.os}}"
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - {os: ubuntu-24.04, python: "3.14", ffmpeg: "9.0.2", extras: true}
+          - {os: ubuntu-24.04, python: "3.12", ffmpeg: "8.1.2"}
+          - {os: ubuntu-24.04, python: "3.13", ffmpeg: "9.0.2"}
+          - {os: ubuntu-24.04-riscv, python: "3.14", ffmpeg: "9.0.2"}
+          - {os: macos-14, python: "3.12", ffmpeg: "8.1.2"}
+          - {os: macos-14, python: "3.14", ffmpeg: "9.0.2"}
+
+    env:
+      PYAV_PYTHON: python${{ matrix.config.python }}
+      PYAV_LIBRARY: ffmpeg-${{ matrix.config.ffmpeg }}
+      # riscv64 wheels (e.g. Pillow) are often missing on PyPI; RISE mirrors
+      # prebuilt wheels for it so uv doesn't have to build them from source.
+      # unsafe-best-match is needed so uv still falls back to PyPI for
+      # packages/versions RISE doesn't happen to carry.
+      UV_INDEX: ${{ matrix.config.os == 'ubuntu-24.04-riscv' && 'https://pypi.riseproject.dev/simple/' || '' }}
+      UV_INDEX_STRATEGY: ${{ matrix.config.os == 'ubuntu-24.04-riscv' && 'unsafe-best-match' || 'first-index' }}
+      # riscv64 uses a pyav-ffmpeg prebuilt to speed up smoke tests; its .pc
+      # files bake in prefix=/tmp/vendor, so it must be extracted there
+      # verbatim and pointed at explicitly.
+      PKG_CONFIG_PATH: ${{ matrix.config.os == 'ubuntu-24.04-riscv' && '/tmp/vendor/lib/pkgconfig' || '' }}
+      LD_LIBRARY_PATH: ${{ matrix.config.os == 'ubuntu-24.04-riscv' && '/tmp/vendor/lib' || '' }}
+
+    steps:
+    - uses: actions/checkout@v7
+      name: Checkout
+
+    - name: Python ${{ matrix.config.python }}
+      uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      with:
+        activate-environment: true
+        python-version: ${{ matrix.config.python }}
+
+    - name: OS Packages
+      run: |
+        case ${{ matrix.config.os }} in
+          ubuntu-24.04)
+            sudo apt-get update
+            sudo apt-get install -y \
+              autoconf \
+              automake \
+              build-essential \
+              cmake \
+              libtool \
+              libx264-dev \
+              nasm \
+              pkg-config \
+              zlib1g-dev
+            if [[ "${{ matrix.config.extras }}" ]]; then
+              sudo apt-get install -y doxygen
+            fi
+            ;;
+          ubuntu-24.04-riscv)
+          # Since we're using pyav-ffmpeg prebuilds, we don't need the full set
+          # of packages installed on other runners. libxcb-shape0 is needed
+          # for the prebuilt's X11 usage.
+            sudo apt-get update
+            sudo apt-get install -y \
+              build-essential \
+              pkg-config \
+              zlib1g-dev \
+              libxcb-shape0
+            ;;
+          macos-14)
+            brew install automake libtool opus x264
+            ;;
+        esac
+
+    - name: Pip and FFmpeg
+      run: |
+        . scripts/activate.sh ffmpeg-${{ matrix.config.ffmpeg }}
+        # don't build from source for riscv64
+        if [ "${{ matrix.config.os }}" = "ubuntu-24.04-riscv" ]; then
+            python scripts/fetch-vendor.py --config-file scripts/ffmpeg-latest.json /tmp/vendor
+        else
+            scripts/build-deps
+        fi
+
+    - name: Build
+      run: |
+        [ "${{ runner.os }}" = "macOS" ] && export ARCHFLAGS="-arch $(uname -m)"
+        . scripts/activate.sh ffmpeg-${{ matrix.config.ffmpeg }}
+        scripts/build
+
+    - name: Test
+      run: |
+        . scripts/activate.sh ffmpeg-${{ matrix.config.ffmpeg }}
+        python -m av --version # Assert it can import.
+        make test
+
+    - name: Docs
+      if: matrix.config.extras
+      run: |
+        . scripts/activate.sh ffmpeg-${{ matrix.config.ffmpeg }}
+        make -C docs html
+
+    - name: Doctest
+      if: matrix.config.extras
+      run: |
+        . scripts/activate.sh ffmpeg-${{ matrix.config.ffmpeg }}
+        make -C docs test
+
+    - name: Examples
+      if: matrix.config.extras
+      run: |
+        . scripts/activate.sh ffmpeg-${{ matrix.config.ffmpeg }}
+        scripts/test examples
+
+  windows:
+    name: "py-${{ matrix.config.python }} lib-${{ matrix.config.ffmpeg }} ${{matrix.config.os}}"
+    runs-on: ${{ matrix.config.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - {os: windows-latest, python: "3.12", ffmpeg: "latest"}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+
+    - name: Set up Conda
+      shell: bash
+      run: |
+        . $CONDA/etc/profile.d/conda.sh
+        conda config --set always_yes true
+        conda config --add channels conda-forge
+        conda config --add channels scientific-python-nightly-wheels
+        conda create -q -n pyav \
+          numpy \
+          pillow \
+          pytest \
+          python=${{ matrix.config.python }} \
+          setuptools \
+          cython
+
+    - name: Build
+      shell: bash
+      run: |
+        . $CONDA/etc/profile.d/conda.sh
+        conda activate pyav
+        python scripts\\fetch-vendor.py --config-file scripts\\ffmpeg-${{ matrix.config.ffmpeg }}.json $CONDA_PREFIX\\Library
+        python setup.py build_ext --inplace --ffmpeg-dir=$CONDA_PREFIX\\Library
+
+    - name: Test
+      shell: bash
+      run: |
+        . $CONDA/etc/profile.d/conda.sh
+        conda activate pyav
+        python -m pytest
+
+  armv7:
+    name: "armv7 cross-build + qemu smoke"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - name: Install build tooling
+        run: |
+          uv venv --seed --python 3.12 .venv-3.12
+          uv venv --seed --python 3.14t .venv-3.14t
+          uv pip install --python .venv-3.12/bin/python -U "cython>=3.1.0,<4" "setuptools>=77.0" wheel
+          uv pip install --python .venv-3.14t/bin/python -U "cython>=3.1.0,<4" "setuptools>=77.0" wheel
+          # patchelf 0.18 (ubuntu-24.04's system version) corrupts ELF files
+          # with large p_align; pin <0.18 for auditwheel to use.
+          uv pip install --python .venv-3.12/bin/python -U ziglang auditwheel 'patchelf<0.18'
+      - name: Cross-compile armv7l wheels with zig
+        env:
+          HOST_PY312: .venv-3.12/bin/python
+          HOST_PY314T: .venv-3.14t/bin/python
+          TOOLS_PY: .venv-3.12/bin/python
+        run: bash scripts/build-armv7l-cross.sh
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm
+      - name: Import-test wheels under emulation
+        run: |
+          docker run --rm --platform linux/arm/v7 -v "$PWD/dist:/dist:ro" \
+            quay.io/pypa/manylinux_2_31_armv7l bash -ceu '
+              for py in /opt/python/cp312-cp312 /opt/python/cp314-cp314t; do
+                echo "::group::$("$py/bin/python" --version)"
+                "$py/bin/pip" install --no-index --find-links /dist av
+                "$py/bin/python" -m av --version
+                echo "::endgroup::"
+              done'

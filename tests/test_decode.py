@@ -1,0 +1,492 @@
+import functools
+import io
+import os
+import pathlib
+from fractions import Fraction
+from typing import cast
+
+import numpy as np
+import pytest
+
+import av
+from av.sidedata.encparams import VideoEncParams
+from av.sidedata.sidedata import Type
+from av.subtitles.subtitle import SubtitleSet
+
+from .common import TestCase, fate_suite
+
+
+@functools.cache
+def make_h264_test_video(path: str) -> None:
+    """Generates a black H264 test video with two streams for testing hardware decoding."""
+
+    # We generate a file here that's designed to be as compatible as possible with hardware
+    # encoders. Hardware encoders are sometimes very picky and the errors we get are often
+    # opaque, so there is nothing much we (PyAV) can do. The user needs to figure that out
+    # if they want to use hwaccel. We only want to test the PyAV plumbing here.
+    # Our video is H264, 1280x720p (note that some decoders have a minimum resolution limit), 24fps,
+    # 8-bit yuv420p.
+    pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
+    output_container = av.open(path, "w")
+
+    streams = []
+    for _ in range(2):
+        stream = output_container.add_stream("libx264", rate=24)
+        assert isinstance(stream, av.VideoStream)
+        stream.width = 1280
+        stream.height = 720
+        stream.pix_fmt = "yuv420p"
+        streams.append(stream)
+
+    for _ in range(24):
+        frame = av.VideoFrame.from_ndarray(
+            np.zeros((720, 1280, 3), dtype=np.uint8), format="rgb24"
+        )
+        for stream in streams:
+            for packet in stream.encode(frame):
+                output_container.mux(packet)
+
+    for stream in streams:
+        for packet in stream.encode():
+            output_container.mux(packet)
+
+    output_container.close()
+
+
+class TestDecode(TestCase):
+    def test_decode_stream_without_codec_context(self) -> None:
+        buffer = io.BytesIO()
+        with av.open(buffer, "w", format="mp4") as output:
+            stream = output.add_mux_stream("h264", width=16, height=16)
+            packet = av.Packet(b"invalid")
+            packet.stream = stream
+            packet.pts = packet.dts = 0
+            packet.time_base = Fraction(1, 1000)
+            output.mux(packet)
+
+        # Keep the MP4 video stream while making its codec unknown to FFmpeg.
+        data = buffer.getvalue().replace(b"avc1", b"zzzz")
+        with av.open(io.BytesIO(data)) as container:
+            stream = container.streams.video[0]
+            assert stream.codec_context is None
+            with pytest.raises(av.DecoderNotFoundError):
+                list(container.decode(stream))
+
+    def test_mux_stream_without_codec_context(self) -> None:
+        with av.open(io.BytesIO(), "w", format="mp4") as output:
+            stream = output.add_mux_stream("h264", width=16, height=16)
+            assert stream.codec_context is None
+            with pytest.raises(av.EncoderNotFoundError):
+                stream.encode(None)
+
+            # A bitstream filter only needs to update codecpar for a mux stream.
+            av.BitStreamFilterContext("h264_mp4toannexb", "h264", out_stream=stream)
+
+    def test_decoded_video_frame_count(self) -> None:
+        container = av.open(fate_suite("h264/interlaced_crop.mp4"))
+        video_stream = next(s for s in container.streams if s.type == "video")
+
+        assert video_stream is container.streams.video[0]
+
+        frame_count = 0
+        for frame in container.decode(video_stream):
+            frame_count += 1
+
+        assert frame_count == video_stream.frames
+
+    def test_flushed_frames_keep_time_base(self) -> None:
+        # `decode()` with no packet has no packet to take the time base from;
+        # it must fall back to the one the container set on the context.
+        container = av.open(fate_suite("h264/interlaced_crop.mp4"))
+        stream = container.streams.video[0]
+        ctx = stream.codec_context
+        assert ctx is not None
+
+        for packet in container.demux(stream):
+            if packet.dts is None:  # the dummy flush packet
+                break
+            ctx.decode(packet)
+
+        flushed = ctx.decode()
+        assert flushed
+        for frame in flushed:
+            assert frame.time_base == stream.time_base
+
+    def test_decode_audio_corrupt(self) -> None:
+        # write an empty file
+        path = self.sandboxed("empty.flac")
+        with open(path, "wb"):
+            pass
+
+        packet_count = 0
+        frame_count = 0
+        audio_frame: av.AudioFrame | None = None
+
+        with av.open(path) as container:
+            for packet in container.demux(audio=0):
+                for frame in packet.decode():
+                    frame_count += 1
+                    audio_frame = frame
+                packet_count += 1
+
+        assert packet_count == 1
+        assert frame_count == 0
+
+    def test_decode_audio_sample_count(self) -> None:
+        container = av.open(fate_suite("audio-reference/chorusnoise_2ch_44kHz_s16.wav"))
+        audio_stream = next(s for s in container.streams if s.type == "audio")
+
+        assert audio_stream is container.streams.audio[0]
+        assert isinstance(audio_stream, av.AudioStream)
+
+        sample_count = 0
+
+        for frame in container.decode(audio_stream):
+            sample_count += frame.samples
+
+        assert audio_stream.duration is not None
+        assert audio_stream.time_base is not None
+        total_samples = (
+            audio_stream.duration
+            * audio_stream.sample_rate.numerator
+            / audio_stream.time_base.denominator
+        )
+        assert sample_count == total_samples
+
+    def test_decoded_time_base(self) -> None:
+        container = av.open(fate_suite("h264/interlaced_crop.mp4"))
+        stream = container.streams.video[0]
+
+        assert stream.time_base == Fraction(1, 25)
+
+        video_frame: av.VideoFrame | None = None
+
+        for packet in container.demux(stream):
+            for frame in packet.decode():
+                video_frame = frame
+                assert not isinstance(frame, SubtitleSet)
+                assert packet.time_base == frame.time_base
+                assert stream.time_base == frame.time_base
+                return
+
+    def test_decoded_motion_vectors(self) -> None:
+        container = av.open(fate_suite("h264/interlaced_crop.mp4"))
+        stream = container.streams.video[0]
+        codec_context = stream.codec_context
+        codec_context.options = {"flags2": "+export_mvs"}
+
+        for frame in container.decode(stream):
+            vectors = frame.side_data.get("MOTION_VECTORS")
+            if frame.key_frame:
+                # Key frame don't have motion vectors
+                assert vectors is None
+            else:
+                assert vectors is not None and len(vectors) > 0
+                return
+
+    def test_motion_vector_index_bounds(self) -> None:
+        container = av.open(fate_suite("h264/interlaced_crop.mp4"))
+        stream = container.streams.video[0]
+        stream.codec_context.options = {"flags2": "+export_mvs"}
+
+        for frame in container.decode(stream):
+            vectors = frame.side_data.get("MOTION_VECTORS")
+            if vectors is None or not len(vectors):
+                continue
+
+            # Negative indices count from the end rather than reading off the
+            # front of the buffer.
+            assert vectors[-1].source == vectors[len(vectors) - 1].source
+            for bad in (len(vectors), -len(vectors) - 1, -(10**9)):
+                with pytest.raises(IndexError):
+                    vectors[bad]
+            return
+
+    def test_decoded_motion_vectors_no_flag(self) -> None:
+        container = av.open(fate_suite("h264/interlaced_crop.mp4"))
+        stream = container.streams.video[0]
+
+        for frame in container.decode(stream):
+            vectors = frame.side_data.get("MOTION_VECTORS")
+            if not frame.key_frame:
+                assert vectors is None
+                return
+
+    def test_decoded_video_enc_params(self) -> None:
+        container = av.open(fate_suite("h264/interlaced_crop.mp4"))
+        stream = container.streams.video[0]
+        stream.codec_context.options = {"export_side_data": "venc_params"}
+
+        for frame in container.decode(stream):
+            video_enc_params = cast(
+                VideoEncParams,
+                frame.side_data.get("VIDEO_ENC_PARAMS"),
+            )
+            assert video_enc_params is not None
+            assert video_enc_params.nb_blocks == 40 * 24
+
+            first_block = video_enc_params.block_params(0)
+            assert video_enc_params.qp + first_block.delta_qp == 29
+            return
+
+    def test_decoded_video_enc_params_no_flag(self) -> None:
+        container = av.open(fate_suite("h264/interlaced_crop.mp4"))
+        stream = container.streams.video[0]
+        # When no additional flag is given, there should be no side data with the video encoding params
+
+        for frame in container.decode(stream):
+            video_enc_params = frame.side_data.get("VIDEO_ENC_PARAMS")
+            assert video_enc_params is None
+
+    def test_decode_video_corrupt(self) -> None:
+        # write an empty file
+        path = self.sandboxed("empty.h264")
+        with open(path, "wb"):
+            pass
+
+        packet_count = 0
+        frame_count = 0
+
+        with av.open(path) as container:
+            for packet in container.demux(video=0):
+                for frame in packet.decode():
+                    frame_count += 1
+                packet_count += 1
+
+        assert packet_count == 1
+        assert frame_count == 0
+
+    def test_decode_close_then_use(self) -> None:
+        container = av.open(fate_suite("h264/interlaced_crop.mp4"))
+        container.close()
+
+        # Check accessing every attribute either works or raises
+        # an `AssertionError`.
+        for attr in dir(container):
+            with self.subTest(attr=attr):
+                try:
+                    getattr(container, attr)
+                except AssertionError:
+                    pass
+
+    def test_flush_decoded_video_frame_count(self) -> None:
+        container = av.open(fate_suite("h264/interlaced_crop.mp4"))
+        video_stream = container.streams.video[0]
+
+        # Decode the first GOP, which requires a flush to get all frames
+        have_keyframe = False
+        input_count = 0
+        output_count = 0
+
+        for packet in container.demux(video_stream):
+            if packet.is_keyframe:
+                if have_keyframe:
+                    break
+                have_keyframe = True
+
+            input_count += 1
+
+            for frame in video_stream.decode(packet):
+                output_count += 1
+
+        # Check the test works as expected and requires a flush
+        assert output_count < input_count
+
+        for frame in video_stream.decode(None):
+            # Flushing has no packet to take the time base from, so it comes
+            # from the context.
+            assert frame.time_base == video_stream.time_base
+            output_count += 1
+
+        assert output_count == input_count
+
+    def test_side_data_mapping_protocol(self) -> None:
+        container = av.open(fate_suite("h264/interlaced_crop.mp4"))
+        stream = container.streams.video[0]
+        stream.codec_context.options = {"flags2": "+export_mvs"}
+
+        for frame in container.decode(stream):
+            side_data = frame.side_data
+            if not len(side_data):
+                continue
+
+            # Iteration yields keys, so the Mapping mixins work off it.
+            keys = list(side_data)
+            assert all(isinstance(key, Type) for key in keys)
+            assert keys == list(side_data.keys())
+            assert len(keys) == len(side_data)
+            assert list(side_data.items()) == [(k, side_data[k]) for k in keys]
+            assert list(side_data.values()) == [side_data[k] for k in keys]
+            assert side_data == dict(side_data)
+            assert keys[0] in side_data
+
+            # Values stay reachable positionally.
+            assert side_data[0] is side_data[keys[0]]
+            assert list(side_data[:]) == list(side_data.values())
+            return
+
+    def test_side_data_type_unknown(self) -> None:
+        """A type only a newer FFmpeg names must not take Type() down."""
+        unknown = Type(1 << 20)
+        assert unknown.name == "UNKNOWN_1048576"
+        assert unknown.value == 1 << 20
+        assert Type(1 << 20) is unknown
+        assert "UNKNOWN_1048576" not in Type.__members__
+
+        with pytest.raises(ValueError):
+            Type("not a side data type")  # type: ignore[arg-type]
+
+    def test_no_side_data(self) -> None:
+        container = av.open(fate_suite("h264/interlaced_crop.mp4"))
+        frame = next(container.decode(video=0))
+        assert frame.rotation == 0
+
+    def test_side_data(self) -> None:
+        container = av.open(fate_suite("mov/displaymatrix.mov"))
+        frame = next(container.decode(video=0))
+        assert frame.rotation == -90
+
+    def test_hardware_decode(self) -> None:
+        hwdevices_available = av.codec.hwaccel.hwdevices_available()
+        if "HWACCEL_DEVICE_TYPE" not in os.environ:
+            pytest.skip(
+                "Set the HWACCEL_DEVICE_TYPE to run this test. "
+                f"Options are {' '.join(hwdevices_available)}"
+            )
+
+        HWACCEL_DEVICE_TYPE = os.environ["HWACCEL_DEVICE_TYPE"]
+        assert HWACCEL_DEVICE_TYPE in hwdevices_available, (
+            f"{HWACCEL_DEVICE_TYPE} not available"
+        )
+
+        test_video_path = "tests/assets/black.mp4"
+        make_h264_test_video(test_video_path)
+
+        hwaccel = av.codec.hwaccel.HWAccel(
+            device_type=HWACCEL_DEVICE_TYPE, allow_software_fallback=False
+        )
+
+        container = av.open(test_video_path, hwaccel=hwaccel)
+        video_stream = container.streams.video[0]
+        assert video_stream.codec_context.is_hwaccel
+
+        frame_count = 0
+        for frame in container.decode(video_stream):
+            frame_count += 1
+
+        assert frame_count == video_stream.frames
+
+    def test_hardware_create_keeps_flags(self) -> None:
+        hwdevices_available = av.codec.hwaccel.hwdevices_available()
+        if "HWACCEL_DEVICE_TYPE" not in os.environ:
+            pytest.skip(
+                "Set the HWACCEL_DEVICE_TYPE to run this test. "
+                f"Options are {' '.join(hwdevices_available)}"
+            )
+
+        HWACCEL_DEVICE_TYPE = os.environ["HWACCEL_DEVICE_TYPE"]
+        assert HWACCEL_DEVICE_TYPE in hwdevices_available, (
+            f"{HWACCEL_DEVICE_TYPE} not available"
+        )
+
+        # AV_CUDA_USE_PRIMARY_CONTEXT. It is the only flag FFmpeg defines for
+        # device creation, and every other device type ignores it.
+        hwaccel = av.codec.hwaccel.HWAccel(device_type=HWACCEL_DEVICE_TYPE, flags=1)
+        created = hwaccel.create(av.Codec("h264", "r"))
+        assert created.flags == 1
+
+
+@pytest.mark.parametrize("is_hw_owned", [False, True])
+def test_hardware_decode_download_preserves_frame_props(is_hw_owned: bool) -> None:
+    hwdevices_available = av.codec.hwaccel.hwdevices_available()
+    if "HWACCEL_DEVICE_TYPE" not in os.environ:
+        pytest.skip(
+            "Set the HWACCEL_DEVICE_TYPE to run this test. "
+            f"Options are {' '.join(hwdevices_available)}"
+        )
+
+    hwaccel_device_type = os.environ["HWACCEL_DEVICE_TYPE"]
+    assert hwaccel_device_type in hwdevices_available, (
+        f"{hwaccel_device_type} not available"
+    )
+
+    test_video_path = fate_suite("hevc/hdr10_plus_h265_sample.hevc")
+    cpu_frame = decode_first_video_frame(test_video_path)
+    hw_frame = decode_first_video_frame(
+        test_video_path,
+        av.codec.hwaccel.HWAccel(
+            device_type=hwaccel_device_type,
+            is_hw_owned=is_hw_owned,
+            allow_software_fallback=False,
+        ),
+    )
+
+    # Ensure that hardware decoding preserves the frame properties, see #2231
+    assert_video_frame_color_props_match(hw_frame, cpu_frame)
+
+    # Ensure that reformatting also preserves them, even for hardware frames
+    cpu_frame = cpu_frame.reformat(format="bgr24")
+    hw_frame = hw_frame.reformat(format="bgr24")
+    assert_video_frame_color_props_match(hw_frame, cpu_frame)
+
+
+def test_hardware_frame_reformat_matches_downloaded_frame() -> None:
+    hwdevices_available = av.codec.hwaccel.hwdevices_available()
+    if "HWACCEL_DEVICE_TYPE" not in os.environ:
+        pytest.skip(
+            "Set the HWACCEL_DEVICE_TYPE to run this test. "
+            f"Options are {' '.join(hwdevices_available)}"
+        )
+
+    hwaccel_device_type = os.environ["HWACCEL_DEVICE_TYPE"]
+    assert hwaccel_device_type in hwdevices_available, (
+        f"{hwaccel_device_type} not available"
+    )
+
+    test_video_path = fate_suite("h264/interlaced_crop.mp4")
+    downloaded_frame = decode_first_video_frame(
+        test_video_path,
+        av.codec.hwaccel.HWAccel(
+            device_type=hwaccel_device_type,
+            is_hw_owned=False,
+            allow_software_fallback=False,
+        ),
+    )
+    hw_frame = decode_first_video_frame(
+        test_video_path,
+        av.codec.hwaccel.HWAccel(
+            device_type=hwaccel_device_type,
+            is_hw_owned=True,
+            allow_software_fallback=False,
+        ),
+    )
+    assert downloaded_frame.format.name != hw_frame.format.name  # E.g. cuda vs nv12
+
+    # Download hw_frame to CPU and ensure the contents match downloaded_frame
+    sw_format = downloaded_frame.format.name
+    reformatted_frame = hw_frame.reformat(format=sw_format)
+    assert reformatted_frame.format.name == downloaded_frame.format.name
+    assert np.array_equal(
+        reformatted_frame.to_ndarray(format=sw_format),
+        downloaded_frame.to_ndarray(format=sw_format),
+    )
+
+
+def decode_first_video_frame(
+    path: str, hwaccel: av.codec.hwaccel.HWAccel | None = None
+) -> av.VideoFrame:
+    with av.open(path, hwaccel=hwaccel) as container:
+        for packet in container.demux(video=0):
+            frames = packet.decode()
+            if frames:
+                return frames[0]
+    raise AssertionError("expected at least one decoded frame")
+
+
+def assert_video_frame_color_props_match(
+    actual: av.VideoFrame, expected: av.VideoFrame
+) -> None:
+    assert actual.color_range == expected.color_range
+    assert actual.colorspace == expected.colorspace
+    assert actual.color_primaries == expected.color_primaries
+    assert actual.color_trc == expected.color_trc

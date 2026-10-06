@@ -190,6 +190,46 @@ class Graph:
             )
             time_base = AVRational(1, 1000)
 
+        video_template: VideoFrame
+        if isinstance(template, VideoFrame):
+            video_template = template
+            if video_template.ptr.hw_frames_ctx:
+                cy_filter: Filter = Filter("buffer")
+                ctx_name: str = self._get_unique_name(name or cy_filter.name)
+                ptr: cython.pointer[lib.AVFilterContext] = (
+                    lib.avfilter_graph_alloc_filter(
+                        self.ptr,
+                        cy_filter.ptr,
+                        ctx_name,
+                    )
+                )
+                if not ptr:
+                    raise RuntimeError("Could not allocate AVFilterContext")
+
+                ctx: FilterContext = wrap_filter_context(self, cy_filter, ptr)
+                params: cython.pointer[lib.AVBufferSrcParameters] = (
+                    lib.av_buffersrc_parameters_alloc()
+                )
+                if params == cython.NULL:
+                    raise MemoryError("Could not allocate AVBufferSrcParameters")
+
+                try:
+                    params.hw_frames_ctx = video_template.ptr.hw_frames_ctx
+                    err_check(lib.av_buffersrc_parameters_set(ptr, params))
+                finally:
+                    lib.av_free(params)
+
+                ctx.init(
+                    None,
+                    video_size=f"{width}x{height}",
+                    pix_fmt=str(int(VideoFormat(format))),
+                    time_base=str(time_base),
+                    pixel_aspect="1/1",
+                )
+                self._register_context(ctx)
+                self._auto_register()
+                return ctx
+
         return self.add(
             "buffer",
             name=name,

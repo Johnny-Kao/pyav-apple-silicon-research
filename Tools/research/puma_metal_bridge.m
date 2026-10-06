@@ -8,6 +8,8 @@
 #import <IOSurface/IOSurface.h>
 
 static id<MTLDevice> g_device = nil;
+static id<MTLCommandQueue> g_queue = nil;
+static id<MTLComputePipelineState> g_sample_pipeline = nil;
 static CVMetalTextureCacheRef g_cache = NULL;
 static CVMetalBufferCacheRef g_buffer_cache = NULL;
 
@@ -558,6 +560,140 @@ static PyObject *map_buffer_once(PyObject *self, PyObject *arg) {
         (unsigned long long)(uintptr_t)contents);
 }
 
+
+static PyObject *sample_luma_gpu(PyObject *self, PyObject *arg) {
+    unsigned long long raw = PyLong_AsUnsignedLongLong(arg);
+    if (PyErr_Occurred()) {
+        return NULL;
+    }
+    CVPixelBufferRef pb = (CVPixelBufferRef)(uintptr_t)raw;
+    if (pb == NULL) {
+        PyErr_SetString(PyExc_ValueError, "null CVPixelBufferRef");
+        return NULL;
+    }
+    if (g_cache == NULL || g_queue == nil || g_sample_pipeline == nil) {
+        PyErr_SetString(PyExc_RuntimeError, "Metal sampling pipeline unavailable");
+        return NULL;
+    }
+
+    size_t planes = CVPixelBufferGetPlaneCount(pb);
+    if (planes < 2) {
+        PyErr_SetString(PyExc_ValueError, "expected bi-planar VideoToolbox frame");
+        return NULL;
+    }
+
+    size_t width = CVPixelBufferGetWidthOfPlane(pb, 0);
+    size_t height = CVPixelBufferGetHeightOfPlane(pb, 0);
+
+    CVMetalTextureRef y_ref = NULL;
+    CVReturn r = CVMetalTextureCacheCreateTextureFromImage(
+        kCFAllocatorDefault,
+        g_cache,
+        pb,
+        NULL,
+        MTLPixelFormatR8Unorm,
+        width,
+        height,
+        0,
+        &y_ref);
+    if (r != kCVReturnSuccess || y_ref == NULL) {
+        if (y_ref) CFRelease(y_ref);
+        PyErr_Format(
+            PyExc_RuntimeError,
+            "CVMetalTextureCacheCreateTextureFromImage failed: %d",
+            (int)r);
+        return NULL;
+    }
+
+    id<MTLTexture> texture = CVMetalTextureGetTexture(y_ref);
+    if (texture == nil) {
+        CFRelease(y_ref);
+        PyErr_SetString(PyExc_RuntimeError, "Metal luma texture missing");
+        return NULL;
+    }
+
+    const NSUInteger nx = 5;
+    const NSUInteger ny = 4;
+    const NSUInteger count = nx * ny;
+    vector_uint2 coords[count];
+    for (NSUInteger j = 0; j < ny; ++j) {
+        NSUInteger y = (ny == 1) ? 0 : (j * (height - 1) / (ny - 1));
+        for (NSUInteger i = 0; i < nx; ++i) {
+            NSUInteger x = (nx == 1) ? 0 : (i * (width - 1) / (nx - 1));
+            coords[j * nx + i] = (vector_uint2){(uint32_t)x, (uint32_t)y};
+        }
+    }
+
+    id<MTLBuffer> coord_buffer =
+        [g_device newBufferWithBytes:coords
+                              length:sizeof(coords)
+                             options:MTLResourceStorageModeShared];
+    id<MTLBuffer> out_buffer =
+        [g_device newBufferWithLength:count
+                              options:MTLResourceStorageModeShared];
+    if (coord_buffer == nil || out_buffer == nil) {
+        CFRelease(y_ref);
+        PyErr_SetString(PyExc_MemoryError, "failed to allocate Metal sample buffers");
+        return NULL;
+    }
+
+    id<MTLCommandBuffer> command = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    if (command == nil || encoder == nil) {
+        CFRelease(y_ref);
+        PyErr_SetString(PyExc_RuntimeError, "failed to create Metal command encoder");
+        return NULL;
+    }
+
+    [encoder setComputePipelineState:g_sample_pipeline];
+    [encoder setTexture:texture atIndex:0];
+    [encoder setBuffer:out_buffer offset:0 atIndex:0];
+    [encoder setBuffer:coord_buffer offset:0 atIndex:1];
+
+    NSUInteger tg = MIN((NSUInteger)32, g_sample_pipeline.maxTotalThreadsPerThreadgroup);
+    [encoder dispatchThreads:MTLSizeMake(count, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    [encoder endEncoding];
+    [command commit];
+    [command waitUntilCompleted];
+
+    if (command.status == MTLCommandBufferStatusError) {
+        NSString *msg = command.error.localizedDescription ?: @"unknown Metal error";
+        CFRelease(y_ref);
+        PyErr_Format(PyExc_RuntimeError, "Metal sample kernel failed: %s", [msg UTF8String]);
+        return NULL;
+    }
+
+    uint8_t *values = (uint8_t *)out_buffer.contents;
+    if (values == NULL) {
+        CFRelease(y_ref);
+        PyErr_SetString(PyExc_RuntimeError, "Metal sample output has no CPU-visible contents");
+        return NULL;
+    }
+
+    PyObject *result = PyList_New((Py_ssize_t)count);
+    if (result == NULL) {
+        CFRelease(y_ref);
+        return NULL;
+    }
+    for (NSUInteger k = 0; k < count; ++k) {
+        PyObject *entry = Py_BuildValue(
+            "(KKi)",
+            (unsigned long long)coords[k].x,
+            (unsigned long long)coords[k].y,
+            (int)values[k]);
+        if (entry == NULL) {
+            Py_DECREF(result);
+            CFRelease(y_ref);
+            return NULL;
+        }
+        PyList_SET_ITEM(result, (Py_ssize_t)k, entry);
+    }
+
+    CFRelease(y_ref);
+    return result;
+}
+
 static PyObject *buffer_cache_available(
     PyObject *self, PyObject *Py_UNUSED(ignored)) {
     if (g_buffer_cache != NULL) {
@@ -584,6 +720,8 @@ static PyMethodDef methods[] = {
      "Export one CVPixelBuffer plane as a strided kDLMetal DLPack capsule."},
     {"plane_layout", (PyCFunction)plane_layout, METH_O,
      "Return IOSurface-backed plane offset/shape/stride metadata."},
+    {"sample_luma_gpu", (PyCFunction)sample_luma_gpu, METH_O,
+     "Sample deterministic luma pixels through the zero-copy Metal texture view."},
     {"inspect_dlpack_capsule", (PyCFunction)inspect_dlpack_capsule, METH_O,
      "Inspect a legacy DLPack capsule without consuming it."},
     {"buffer_cache_available", (PyCFunction)buffer_cache_available, METH_NOARGS,
@@ -608,6 +746,46 @@ PyMODINIT_FUNC PyInit_puma_metal_bridge(void) {
             PyErr_SetString(PyExc_RuntimeError, "no Metal device");
             return NULL;
         }
+
+        g_queue = [g_device newCommandQueue];
+        if (g_queue == nil) {
+            PyErr_SetString(PyExc_RuntimeError, "cannot create Metal command queue");
+            return NULL;
+        }
+
+        NSString *source =
+            @"#include <metal_stdlib>\n"
+             "using namespace metal;\n"
+             "kernel void puma_sample_luma("
+             "texture2d<float, access::read> tex [[texture(0)]],"
+             "device uchar *out [[buffer(0)]],"
+             "constant uint2 *coords [[buffer(1)]],"
+             "uint tid [[thread_position_in_grid]]) {"
+             "  float v = tex.read(coords[tid]).r;"
+             "  out[tid] = (uchar)clamp(rint(v * 255.0f), 0.0f, 255.0f);"
+             "}\n";
+        NSError *library_error = nil;
+        id<MTLLibrary> library =
+            [g_device newLibraryWithSource:source options:nil error:&library_error];
+        if (library == nil) {
+            const char *msg = library_error.localizedDescription.UTF8String;
+            PyErr_Format(PyExc_RuntimeError, "Metal library compile failed: %s", msg ?: "unknown");
+            return NULL;
+        }
+        id<MTLFunction> fn = [library newFunctionWithName:@"puma_sample_luma"];
+        if (fn == nil) {
+            PyErr_SetString(PyExc_RuntimeError, "Metal sample function missing");
+            return NULL;
+        }
+        NSError *pipeline_error = nil;
+        g_sample_pipeline =
+            [g_device newComputePipelineStateWithFunction:fn error:&pipeline_error];
+        if (g_sample_pipeline == nil) {
+            const char *msg = pipeline_error.localizedDescription.UTF8String;
+            PyErr_Format(PyExc_RuntimeError, "Metal sample pipeline failed: %s", msg ?: "unknown");
+            return NULL;
+        }
+
         CVReturn r = CVMetalTextureCacheCreate(
             kCFAllocatorDefault, NULL, g_device, NULL, &g_cache);
         if (r != kCVReturnSuccess || g_cache == NULL) {

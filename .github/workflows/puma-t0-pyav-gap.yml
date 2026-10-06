@@ -1,0 +1,66 @@
+name: PUMA T0 PyAV Hardware-Frame Gap
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pyav-gap:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - name: Checkout research snapshot
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Environment fingerprint
+        run: |
+          echo "repo_sha=$GITHUB_SHA"
+          uname -a
+          uname -m
+          sw_vers
+          sysctl -n hw.model || true
+          python --version
+
+      - name: Install production PyAV
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "av==19.0.1" numpy
+
+      - name: Run hardware-frame transfer gap probe
+        run: |
+          python Tools/research/puma_t0_pyav_gap.py | tee /tmp/puma_t0_gap.json
+
+      - name: Decision summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          out = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          p = Path("/tmp/puma_t0_gap.json")
+          with out.open("a") as f:
+              f.write("## PUMA T0 — PyAV hardware-frame gap\n\n")
+              f.write(f"- research commit: {os.environ['GITHUB_SHA']}\n")
+              f.write("- runner: macos-15 / arm64 M1 VM\n\n")
+              if p.exists():
+                  data = json.loads(p.read_text())
+                  s = data["summary"]
+                  f.write(f"- frame: {s['first_hw_frame']}\n")
+                  f.write(f"- retained: {s['retained_wall_ms_per_frame']:.4f} ms/frame\n")
+                  f.write(f"- auto-download: {s['downloaded_wall_ms_per_frame']:.4f} ms/frame\n")
+                  f.write(f"- download/retained wall ratio: {s['download_vs_retained_wall_ratio']:.2f}x\n")
+                  f.write(f"- explicit transfer added: {s['explicit_transfer_added_ms_vs_retained']:.4f} ms/frame\n")
+                  f.write(f"- RGB NumPy added: {s['rgb_numpy_added_ms_vs_retained']:.4f} ms/frame\n")
+                  f.write(f"- approx NV12 bytes/frame: {s['approx_nv12_bytes_per_frame']}\n")
+              else:
+                  f.write("- result: NOT EXECUTED / harness failure before JSON output\n")
+          PY

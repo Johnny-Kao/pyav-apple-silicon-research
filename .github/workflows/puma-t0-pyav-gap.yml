@@ -35,7 +35,8 @@ jobs:
 
       - name: Run hardware-frame transfer gap probe
         run: |
-          python Tools/research/puma_t0_pyav_gap.py | tee /tmp/puma_t0_gap.json
+          python Tools/research/puma_t0_pyav_gap.py > /tmp/puma_t0_gap.json
+          cat /tmp/puma_t0_gap.json
 
       - name: Decision summary
         if: always()
@@ -51,7 +52,7 @@ jobs:
               f.write("## PUMA T0 — PyAV hardware-frame gap\n\n")
               f.write(f"- research commit: {os.environ['GITHUB_SHA']}\n")
               f.write("- runner: macos-15 / arm64 M1 VM\n\n")
-              if p.exists():
+              if p.exists() and p.stat().st_size:
                   data = json.loads(p.read_text())
                   s = data["summary"]
                   f.write(f"- frame: {s['first_hw_frame']}\n")

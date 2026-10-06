@@ -1,0 +1,55 @@
+name: PUMA T0 Apple Hardware Capability
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capability:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Checkout research snapshot
+        uses: actions/checkout@v4
+
+      - name: Environment fingerprint
+        run: |
+          echo "repo_sha=$GITHUB_SHA"
+          uname -a
+          uname -m
+          sw_vers
+          sysctl -n hw.model || true
+          sysctl -n hw.memsize || true
+          system_profiler SPHardwareDataType || true
+          system_profiler SPDisplaysDataType || true
+
+      - name: Build Apple hardware capability probe
+        run: |
+          clang -fobjc-arc \
+            -framework Foundation \
+            -framework Metal \
+            -framework VideoToolbox \
+            -framework CoreVideo \
+            -framework CoreMedia \
+            Tools/research/puma_t0_capability.m \
+            -o /tmp/puma_t0_capability
+
+      - name: Run capability probe
+        run: |
+          /tmp/puma_t0_capability | tee /tmp/puma_t0_capability.txt
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "## PUMA T0 — Apple hardware capability"
+            echo
+            echo "- research commit: `$GITHUB_SHA`"
+            echo "- runner: macos-15"
+            echo
+            echo "```text"
+            cat /tmp/puma_t0_capability.txt 2>/dev/null || true
+            echo "```"
+          } >> "$GITHUB_STEP_SUMMARY"

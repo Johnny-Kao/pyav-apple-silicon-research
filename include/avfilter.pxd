@@ -90,4 +90,12 @@ cdef extern from "libavfilter/buffersink.h" nogil:
     int av_buffersink_get_frame(AVFilterContext *ctx, AVFrame *frame)
 
 cdef extern from "libavfilter/buffersrc.h" nogil:
+    ctypedef struct AVBufferSrcParameters:
+        AVBufferRef *hw_frames_ctx
+
+    AVBufferSrcParameters *av_buffersrc_parameters_alloc()
+    int av_buffersrc_parameters_set(
+        AVFilterContext *ctx,
+        AVBufferSrcParameters *param
+    )
     int av_buffersrc_write_frame(AVFilterContext *ctx, const AVFrame *frame)

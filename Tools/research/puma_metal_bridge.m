@@ -5,6 +5,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <CoreVideo/CoreVideo.h>
+#import <IOSurface/IOSurface.h>
 
 static id<MTLDevice> g_device = nil;
 static CVMetalTextureCacheRef g_cache = NULL;
@@ -126,8 +127,8 @@ typedef struct PumaDLManagedTensor {
 typedef struct {
     PumaDLManagedTensor managed;
     CVMetalBufferRef cvbuf;
-    int64_t shape[1];
-    int64_t strides[1];
+    int64_t shape[3];
+    int64_t strides[3];
 } PumaMetalDLContext;
 
 enum {
@@ -165,6 +166,249 @@ static void puma_dlpack_capsule_destructor(PyObject *capsule) {
     if (managed->deleter != NULL) {
         managed->deleter(managed);
     }
+}
+
+
+static int puma_plane_offset(
+    IOSurfaceRef surface,
+    size_t plane,
+    uint64_t *offset_out)
+{
+    CFTypeRef value = IOSurfaceCopyValue(surface, kIOSurfacePlaneInfo);
+    if (value != NULL && CFGetTypeID(value) == CFArrayGetTypeID()) {
+        CFArrayRef planes = (CFArrayRef)value;
+        if (plane < (size_t)CFArrayGetCount(planes)) {
+            CFTypeRef entry = CFArrayGetValueAtIndex(planes, (CFIndex)plane);
+            if (entry != NULL &&
+                CFGetTypeID(entry) == CFDictionaryGetTypeID()) {
+                CFTypeRef base = CFDictionaryGetValue(
+                    (CFDictionaryRef)entry, kIOSurfacePlaneBase);
+                if (base != NULL &&
+                    CFGetTypeID(base) == CFNumberGetTypeID()) {
+                    int64_t offset = 0;
+                    if (CFNumberGetValue(
+                            (CFNumberRef)base,
+                            kCFNumberSInt64Type,
+                            &offset) &&
+                        offset >= 0) {
+                        *offset_out = (uint64_t)offset;
+                        CFRelease(value);
+                        return 0;
+                    }
+                }
+            }
+        }
+        CFRelease(value);
+    }
+    else if (value != NULL) {
+        CFRelease(value);
+    }
+
+    /* Fallback for IOSurfaces whose plane dictionary omits kIOSurfacePlaneBase.
+       We only use this to derive metadata; no pixel bytes are copied. */
+    uint32_t seed = 0;
+    kern_return_t kr = IOSurfaceLock(
+        surface, kIOSurfaceLockReadOnly, &seed);
+    if (kr != KERN_SUCCESS) {
+        return -1;
+    }
+    void *base = IOSurfaceGetBaseAddress(surface);
+    void *plane_base = IOSurfaceGetBaseAddressOfPlane(surface, plane);
+    int ok = 0;
+    if (base != NULL && plane_base != NULL &&
+        (uintptr_t)plane_base >= (uintptr_t)base) {
+        *offset_out =
+            (uint64_t)((uintptr_t)plane_base - (uintptr_t)base);
+        ok = 1;
+    }
+    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, &seed);
+    return ok ? 0 : -1;
+}
+
+static PyObject *plane_layout(PyObject *self, PyObject *arg) {
+    unsigned long long raw = PyLong_AsUnsignedLongLong(arg);
+    if (PyErr_Occurred()) {
+        return NULL;
+    }
+    CVPixelBufferRef pb = (CVPixelBufferRef)(uintptr_t)raw;
+    if (pb == NULL) {
+        PyErr_SetString(PyExc_ValueError, "null CVPixelBufferRef");
+        return NULL;
+    }
+    IOSurfaceRef surface = CVPixelBufferGetIOSurface(pb);
+    if (surface == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "CVPixelBuffer has no IOSurface");
+        return NULL;
+    }
+
+    size_t count = CVPixelBufferGetPlaneCount(pb);
+    PyObject *list = PyList_New((Py_ssize_t)count);
+    if (list == NULL) {
+        return NULL;
+    }
+
+    for (size_t plane = 0; plane < count; ++plane) {
+        uint64_t offset = 0;
+        if (puma_plane_offset(surface, plane, &offset) < 0) {
+            Py_DECREF(list);
+            PyErr_Format(
+                PyExc_RuntimeError,
+                "cannot determine IOSurface offset for plane %zu",
+                plane);
+            return NULL;
+        }
+        size_t width = CVPixelBufferGetWidthOfPlane(pb, plane);
+        size_t height = CVPixelBufferGetHeightOfPlane(pb, plane);
+        size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, plane);
+        size_t bpe = IOSurfaceGetBytesPerElementOfPlane(surface, plane);
+        if (bpe == 0) {
+            bpe = 1;
+        }
+        PyObject *entry = Py_BuildValue(
+            "(KKKKK)",
+            (unsigned long long)offset,
+            (unsigned long long)width,
+            (unsigned long long)height,
+            (unsigned long long)bpr,
+            (unsigned long long)bpe);
+        if (entry == NULL) {
+            Py_DECREF(list);
+            return NULL;
+        }
+        PyList_SET_ITEM(list, (Py_ssize_t)plane, entry);
+    }
+    return list;
+}
+
+static PyObject *make_dlpack_plane_capsule(
+    PyObject *self, PyObject *args)
+{
+    unsigned long long raw = 0;
+    Py_ssize_t plane_index = 0;
+    if (!PyArg_ParseTuple(args, "Kn", &raw, &plane_index)) {
+        return NULL;
+    }
+
+    CVPixelBufferRef pb = (CVPixelBufferRef)(uintptr_t)raw;
+    if (pb == NULL) {
+        PyErr_SetString(PyExc_ValueError, "null CVPixelBufferRef");
+        return NULL;
+    }
+    if (plane_index < 0 ||
+        (size_t)plane_index >= CVPixelBufferGetPlaneCount(pb)) {
+        PyErr_SetString(PyExc_IndexError, "invalid CVPixelBuffer plane");
+        return NULL;
+    }
+    if (g_buffer_cache == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "CVMetalBufferCache unavailable");
+        return NULL;
+    }
+
+    IOSurfaceRef surface = CVPixelBufferGetIOSurface(pb);
+    if (surface == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "CVPixelBuffer has no IOSurface");
+        return NULL;
+    }
+
+    CVMetalBufferRef cvbuf = NULL;
+    CVReturn r = CVMetalBufferCacheCreateBufferFromImage(
+        kCFAllocatorDefault, g_buffer_cache, pb, &cvbuf);
+    if (r != kCVReturnSuccess || cvbuf == NULL) {
+        if (cvbuf != NULL) {
+            CFRelease(cvbuf);
+        }
+        PyErr_Format(
+            PyExc_RuntimeError,
+            "CVMetalBufferCacheCreateBufferFromImage failed: %d",
+            (int)r);
+        return NULL;
+    }
+
+    id<MTLBuffer> buffer = CVMetalBufferGetBuffer(cvbuf);
+    if (buffer == nil) {
+        CFRelease(cvbuf);
+        PyErr_SetString(PyExc_RuntimeError, "CVMetalBuffer has no MTLBuffer");
+        return NULL;
+    }
+
+    uint64_t offset = 0;
+    if (puma_plane_offset(surface, (size_t)plane_index, &offset) < 0) {
+        CFRelease(cvbuf);
+        PyErr_SetString(
+            PyExc_RuntimeError,
+            "cannot determine IOSurface plane offset");
+        return NULL;
+    }
+
+    size_t width = CVPixelBufferGetWidthOfPlane(pb, (size_t)plane_index);
+    size_t height = CVPixelBufferGetHeightOfPlane(pb, (size_t)plane_index);
+    size_t bpr =
+        CVPixelBufferGetBytesPerRowOfPlane(pb, (size_t)plane_index);
+    size_t bpe =
+        IOSurfaceGetBytesPerElementOfPlane(surface, (size_t)plane_index);
+    if (bpe == 0) {
+        bpe = 1;
+    }
+
+    uint64_t active_end =
+        offset +
+        (height > 0 ? (uint64_t)(height - 1) * bpr : 0) +
+        (uint64_t)width * bpe;
+    if (active_end > (uint64_t)buffer.length) {
+        CFRelease(cvbuf);
+        PyErr_Format(
+            PyExc_RuntimeError,
+            "plane %zd exceeds Metal buffer: end=%llu length=%llu",
+            plane_index,
+            (unsigned long long)active_end,
+            (unsigned long long)buffer.length);
+        return NULL;
+    }
+
+    PumaMetalDLContext *ctx =
+        (PumaMetalDLContext *)calloc(1, sizeof(PumaMetalDLContext));
+    if (ctx == NULL) {
+        CFRelease(cvbuf);
+        return PyErr_NoMemory();
+    }
+
+    ctx->cvbuf = cvbuf;
+    if (bpe == 1) {
+        ctx->shape[0] = (int64_t)height;
+        ctx->shape[1] = (int64_t)width;
+        ctx->strides[0] = (int64_t)bpr;
+        ctx->strides[1] = 1;
+        ctx->managed.dl_tensor.ndim = 2;
+    }
+    else {
+        ctx->shape[0] = (int64_t)height;
+        ctx->shape[1] = (int64_t)width;
+        ctx->shape[2] = (int64_t)bpe;
+        ctx->strides[0] = (int64_t)bpr;
+        ctx->strides[1] = (int64_t)bpe;
+        ctx->strides[2] = 1;
+        ctx->managed.dl_tensor.ndim = 3;
+    }
+
+    ctx->managed.dl_tensor.data = (__bridge void *)buffer;
+    ctx->managed.dl_tensor.device.device_type = PUMA_KDL_METAL;
+    ctx->managed.dl_tensor.device.device_id = 0;
+    ctx->managed.dl_tensor.dtype.code = PUMA_KDL_UINT;
+    ctx->managed.dl_tensor.dtype.bits = 8;
+    ctx->managed.dl_tensor.dtype.lanes = 1;
+    ctx->managed.dl_tensor.shape = ctx->shape;
+    ctx->managed.dl_tensor.strides = ctx->strides;
+    ctx->managed.dl_tensor.byte_offset = offset;
+    ctx->managed.manager_ctx = ctx;
+    ctx->managed.deleter = puma_dlpack_deleter;
+
+    PyObject *capsule = PyCapsule_New(
+        &ctx->managed, "dltensor", puma_dlpack_capsule_destructor);
+    if (capsule == NULL) {
+        puma_dlpack_deleter(&ctx->managed);
+        return NULL;
+    }
+    return capsule;
 }
 
 static PyObject *make_dlpack_capsule(PyObject *self, PyObject *arg) {
@@ -335,7 +579,11 @@ static PyMethodDef methods[] = {
     {"map_buffer_once", (PyCFunction)map_buffer_once, METH_O,
      "Create a transient CVMetalBuffer/MTLBuffer live binding."},
     {"make_dlpack_capsule", (PyCFunction)make_dlpack_capsule, METH_O,
-     "Export a CVPixelBuffer as a kDLMetal uint8 DLPack capsule."},
+     "Export a CVPixelBuffer as a flat kDLMetal uint8 DLPack capsule."},
+    {"make_dlpack_plane_capsule", (PyCFunction)make_dlpack_plane_capsule, METH_VARARGS,
+     "Export one CVPixelBuffer plane as a strided kDLMetal DLPack capsule."},
+    {"plane_layout", (PyCFunction)plane_layout, METH_O,
+     "Return IOSurface-backed plane offset/shape/stride metadata."},
     {"inspect_dlpack_capsule", (PyCFunction)inspect_dlpack_capsule, METH_O,
      "Inspect a legacy DLPack capsule without consuming it."},
     {"buffer_cache_available", (PyCFunction)buffer_cache_available, METH_NOARGS,

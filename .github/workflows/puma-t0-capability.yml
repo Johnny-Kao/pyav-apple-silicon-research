@@ -43,13 +43,18 @@ jobs:
       - name: Summarize
         if: always()
         run: |
-          {
-            echo "## PUMA T0 — Apple hardware capability"
-            echo
-            echo "- research commit: `$GITHUB_SHA`"
-            echo "- runner: macos-15"
-            echo
-            echo "```text"
-            cat /tmp/puma_t0_capability.txt 2>/dev/null || true
-            echo "```"
-          } >> "$GITHUB_STEP_SUMMARY"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          out = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          probe = Path("/tmp/puma_t0_capability.txt")
+          with out.open("a") as f:
+              f.write("## PUMA T0 — Apple hardware capability\n\n")
+              f.write(f"- research commit: {os.environ['GITHUB_SHA']}\n")
+              f.write("- runner: macos-15\n\n")
+              if probe.exists():
+                  f.write("    " + probe.read_text().replace("\n", "\n    "))
+              else:
+                  f.write("- probe output missing\n")
+          PY

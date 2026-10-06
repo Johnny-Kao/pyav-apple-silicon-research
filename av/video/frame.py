@@ -626,6 +626,19 @@ class VideoFrame(Frame):
         )
         return get_video_format(frames_ctx.sw_format, self.ptr.width, self.ptr.height)
 
+    def _research_videotoolbox_pixel_buffer_address(self):
+        """Return the CVPixelBufferRef address for a VideoToolbox hardware frame.
+
+        Research-only escape hatch for PUMA experiments. The returned address is
+        borrowed from this VideoFrame; callers must not retain it past the frame's
+        lifetime and must not use it for non-VideoToolbox frames.
+        """
+        if self.format.name != "videotoolbox_vld":
+            raise ValueError("frame is not a VideoToolbox hardware frame")
+        if not self.ptr.hw_frames_ctx or not self.ptr.data[3]:
+            raise ValueError("VideoToolbox frame has no CVPixelBufferRef")
+        return cython.cast(uintptr_t, self.ptr.data[3])
+
     def __repr__(self):
         return (
             f"<av.{self.__class__.__name__}, pts={self.pts} {self.format.name} "

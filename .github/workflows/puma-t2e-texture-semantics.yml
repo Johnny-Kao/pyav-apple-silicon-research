@@ -2,6 +2,11 @@ name: PUMA T2E VideoToolbox Metal Semantics
 
 on:
   workflow_dispatch:
+    inputs:
+      note:
+        description: "Research dispatch marker"
+        required: false
+        default: "t2e"
 
 permissions:
   contents: read

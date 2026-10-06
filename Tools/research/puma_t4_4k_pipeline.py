@@ -36,18 +36,44 @@ def pull_one(graph):
             continue
 
 
-def make_encoder(path, out_w, out_h, rate):
+def videotoolbox_hw_format():
+    for config in av.Codec("h264_videotoolbox", "w").hardware_configs:
+        if (
+            config.device_type is not None
+            and config.device_type.name == "videotoolbox"
+            and config.format is not None
+        ):
+            return config.format.name
+    raise RuntimeError("no VideoToolbox hardware pixel format exposed by FFmpeg")
+
+
+def make_encoder(path, out_w, out_h, rate, *, hardware_input):
     out = av.open(path, "w")
     stream = out.add_stream(
         "h264_videotoolbox",
         rate=rate,
-        hwaccel=HWAccel(device_type="videotoolbox"),
+        hwaccel=HWAccel(
+            device_type="videotoolbox",
+            allow_software_fallback=False,
+        ),
     )
     stream.width = out_w
     stream.height = out_h
     stream.bit_rate = 8_000_000
     stream.gop_size = 60
     stream.codec_context.max_b_frames = 0
+
+    if hardware_input:
+        # Hardware frames already carry a VideoToolbox hw_frames_ctx. Tell the
+        # encoder that the incoming AVFrame itself is the hardware format while
+        # retaining NV12 as the underlying software layout.
+        stream.pix_fmt = videotoolbox_hw_format()
+        stream.codec_context.sw_format = "nv12"
+    else:
+        # Match PyAV's supported software-frame hardware-encode contract:
+        # software NV12 frames are uploaded automatically by the encoder.
+        stream.pix_fmt = "nv12"
+
     return out, stream
 
 
@@ -72,7 +98,7 @@ def run_candidate(src_path, out_path, out_w, out_h, max_frames, rate):
     wall0 = time.perf_counter_ns()
     cpu0 = time.process_time_ns()
 
-    out, stream = make_encoder(out_path, out_w, out_h, rate)
+    out, stream = make_encoder(out_path, out_w, out_h, rate, hardware_input=True)
     graph = None
     device = None
 
@@ -133,7 +159,7 @@ def run_baseline(src_path, out_path, out_w, out_h, max_frames, rate):
     wall0 = time.perf_counter_ns()
     cpu0 = time.process_time_ns()
 
-    out, stream = make_encoder(out_path, out_w, out_h, rate)
+    out, stream = make_encoder(out_path, out_w, out_h, rate, hardware_input=False)
 
     with av.open(src_path, hwaccel=hw) as container:
         for frame in container.decode(video=0):

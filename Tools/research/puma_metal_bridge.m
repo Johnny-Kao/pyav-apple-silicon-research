@@ -8,6 +8,7 @@
 
 static id<MTLDevice> g_device = nil;
 static CVMetalTextureCacheRef g_cache = NULL;
+static CVMetalBufferCacheRef g_buffer_cache = NULL;
 
 static PyObject *map_once(PyObject *self, PyObject *arg) {
     unsigned long long raw = PyLong_AsUnsignedLongLong(arg);
@@ -94,6 +95,67 @@ static PyObject *map_once(PyObject *self, PyObject *arg) {
         (unsigned long long)uvh);
 }
 
+static PyObject *map_buffer_once(PyObject *self, PyObject *arg) {
+    unsigned long long raw = PyLong_AsUnsignedLongLong(arg);
+    if (PyErr_Occurred()) {
+        return NULL;
+    }
+
+    CVPixelBufferRef pb = (CVPixelBufferRef)(uintptr_t)raw;
+    if (pb == NULL) {
+        PyErr_SetString(PyExc_ValueError, "null CVPixelBufferRef");
+        return NULL;
+    }
+    if (g_buffer_cache == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "CVMetalBufferCache unavailable");
+        return NULL;
+    }
+
+    CVMetalBufferRef cvbuf = NULL;
+    CVReturn r = CVMetalBufferCacheCreateBufferFromImage(
+        kCFAllocatorDefault,
+        g_buffer_cache,
+        pb,
+        &cvbuf);
+    if (r != kCVReturnSuccess || cvbuf == NULL) {
+        if (cvbuf) CFRelease(cvbuf);
+        PyErr_Format(
+            PyExc_RuntimeError,
+            "CVMetalBufferCacheCreateBufferFromImage failed: %d",
+            (int)r);
+        return NULL;
+    }
+
+    id<MTLBuffer> buffer = CVMetalBufferGetBuffer(cvbuf);
+    if (buffer == nil) {
+        CFRelease(cvbuf);
+        PyErr_SetString(PyExc_RuntimeError, "CVMetalBuffer has no MTLBuffer");
+        return NULL;
+    }
+
+    NSUInteger length = buffer.length;
+    NSUInteger storage_mode = buffer.storageMode;
+    NSUInteger cpu_cache_mode = buffer.cpuCacheMode;
+    void *contents = buffer.contents;
+
+    CFRelease(cvbuf);
+
+    return Py_BuildValue(
+        "(KKKK)",
+        (unsigned long long)length,
+        (unsigned long long)storage_mode,
+        (unsigned long long)cpu_cache_mode,
+        (unsigned long long)(uintptr_t)contents);
+}
+
+static PyObject *buffer_cache_available(
+    PyObject *self, PyObject *Py_UNUSED(ignored)) {
+    if (g_buffer_cache != NULL) {
+        Py_RETURN_TRUE;
+    }
+    Py_RETURN_FALSE;
+}
+
 static PyObject *device_name(PyObject *self, PyObject *Py_UNUSED(ignored)) {
     if (g_device == nil) {
         Py_RETURN_NONE;
@@ -104,6 +166,10 @@ static PyObject *device_name(PyObject *self, PyObject *Py_UNUSED(ignored)) {
 static PyMethodDef methods[] = {
     {"map_once", (PyCFunction)map_once, METH_O,
      "Create transient Metal texture views for a borrowed CVPixelBufferRef."},
+    {"map_buffer_once", (PyCFunction)map_buffer_once, METH_O,
+     "Create a transient CVMetalBuffer/MTLBuffer live binding."},
+    {"buffer_cache_available", (PyCFunction)buffer_cache_available, METH_NOARGS,
+     "Return whether CVMetalBufferCache initialization succeeded."},
     {"device_name", (PyCFunction)device_name, METH_NOARGS,
      "Return the active Metal device name."},
     {NULL, NULL, 0, NULL},
@@ -131,6 +197,13 @@ PyMODINIT_FUNC PyInit_puma_metal_bridge(void) {
                          "CVMetalTextureCacheCreate failed: %d", (int)r);
             return NULL;
         }
+
+        CVReturn br = CVMetalBufferCacheCreate(
+            kCFAllocatorDefault, NULL, g_device, &g_buffer_cache);
+        if (br != kCVReturnSuccess) {
+            g_buffer_cache = NULL;
+        }
+
         return PyModule_Create(&module);
     }
 }

@@ -615,12 +615,16 @@ static PyObject *sample_luma_gpu(PyObject *self, PyObject *arg) {
     const NSUInteger nx = 5;
     const NSUInteger ny = 4;
     const NSUInteger count = nx * ny;
-    vector_uint2 coords[count];
+    typedef struct {
+        uint32_t x;
+        uint32_t y;
+    } PumaCoord;
+    PumaCoord coords[20];
     for (NSUInteger j = 0; j < ny; ++j) {
         NSUInteger y = (ny == 1) ? 0 : (j * (height - 1) / (ny - 1));
         for (NSUInteger i = 0; i < nx; ++i) {
             NSUInteger x = (nx == 1) ? 0 : (i * (width - 1) / (nx - 1));
-            coords[j * nx + i] = (vector_uint2){(uint32_t)x, (uint32_t)y};
+            coords[j * nx + i] = (PumaCoord){(uint32_t)x, (uint32_t)y};
         }
     }
 

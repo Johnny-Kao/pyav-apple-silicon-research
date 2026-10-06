@@ -116,8 +116,6 @@ def bench(path, out_w, out_h, max_frames):
                 t0 = time.perf_counter_ns()
                 out = frame.reformat(width=out_w, height=out_h, format=sw)
                 t1 = time.perf_counter_ns()
-                if out.ptr if False else False:
-                    pass
                 if out.format.name != sw:
                     raise RuntimeError(
                         f"baseline output format {out.format.name} != {sw}"

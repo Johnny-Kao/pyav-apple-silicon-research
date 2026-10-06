@@ -1,0 +1,116 @@
+name: PUMA T2 VideoToolbox Scale
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scale:
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout research branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Environment fingerprint
+        run: |
+          echo "repo_sha=$GITHUB_SHA"
+          uname -a
+          uname -m
+          sw_vers
+          sysctl -n hw.model || true
+          system_profiler SPHardwareDataType || true
+
+      - name: Install FFmpeg and build dependencies
+        run: |
+          if ! command -v pkg-config >/dev/null 2>&1; then
+            brew install pkg-config
+          fi
+          if ! pkg-config --exists libavformat 2>/dev/null; then
+            brew install ffmpeg
+          fi
+          ffmpeg -hide_banner -filters | grep -E 'scale_vt|transpose_vt|yadif_videotoolbox' || true
+          ffmpeg -version | head -n 3
+          python -m pip install --upgrade pip
+          python -m pip install "cython>=3.3,<4" setuptools wheel numpy
+
+      - name: Build research PyAV
+        run: |
+          export PKG_CONFIG_PATH="$(brew --prefix ffmpeg)/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          python -m pip uninstall -y av || true
+          python -m pip install --no-build-isolation .
+          cd /tmp
+          python - <<'PY'
+          import av
+          from av.codec.hwaccel import hwdevices_available
+
+          print("pyav_version=", av.__version__)
+          print("pyav_file=", av.__file__)
+          print("hwdevices=", hwdevices_available())
+          print("scale_vt_filter=", av.filter.Filter("scale_vt"))
+          assert "videotoolbox" in hwdevices_available()
+          PY
+
+      - name: Generate controlled inputs
+        run: |
+          make_clip() {
+            local size="$1"
+            local frames="$2"
+            local bitrate="$3"
+            local out="$4"
+            if ffmpeg -hide_banner -loglevel error -y               -f lavfi -i "testsrc2=size=${size}:rate=60"               -frames:v "$frames" -an -pix_fmt nv12               -c:v h264_videotoolbox -b:v "$bitrate" -g 60 -bf 0 "$out"; then
+              echo "generated $out with h264_videotoolbox"
+            else
+              echo "VideoToolbox encode unavailable; falling back to libx264"
+              ffmpeg -hide_banner -loglevel error -y                 -f lavfi -i "testsrc2=size=${size}:rate=60"                 -frames:v "$frames" -an                 -c:v libx264 -preset ultrafast -tune zerolatency -g 60 -bf 0 "$out"
+            fi
+          }
+          make_clip 1920x1080 180 12M /tmp/puma1080.mp4
+          make_clip 3840x2160 120 35M /tmp/puma4k.mp4
+
+      - name: Run T2 scale comparison
+        run: |
+          cd /tmp
+          python "$GITHUB_WORKSPACE/Tools/research/puma_t2_scale_vt.py"             --case /tmp/puma1080.mp4 1280 720 120             --case /tmp/puma4k.mp4 1920 1080 90             > /tmp/puma_t2_scale.json
+          cat /tmp/puma_t2_scale.json
+
+      - name: Decision summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          p = Path("/tmp/puma_t2_scale.json")
+          out = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with out.open("a") as f:
+              f.write("## PUMA T2 — VideoToolbox hardware scale\n\n")
+              f.write(f"- research commit: {os.environ['GITHUB_SHA']}\n")
+              if not (p.exists() and p.stat().st_size):
+                  f.write("- result: NOT EXECUTED / failed before JSON output\n")
+              else:
+                  data = json.loads(p.read_text())
+                  f.write(f"- PyAV: {data['pyav_version']}\n\n")
+                  f.write("| resize | CPU reformat | scale_vt | CPU/VT | HW retained |\n")
+                  f.write("|---|---:|---:|---:|---|\n")
+                  for case in data["cases"]:
+                      s = case["summary"]
+                      i = case["input"]
+                      o = case["output"]
+                      f.write(
+                          f"| {i['width']}x{i['height']} → {o['width']}x{o['height']} | "
+                          f"{s['baseline_median_us']:.1f} us | "
+                          f"{s['candidate_median_us']:.1f} us | "
+                          f"{s['baseline_over_candidate']:.2f}x | "
+                          f"{s['candidate_keeps_hardware_frame']} |\n"
+                      )
+          PY

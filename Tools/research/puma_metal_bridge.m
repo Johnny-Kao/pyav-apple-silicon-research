@@ -11,6 +11,7 @@
 static id<MTLDevice> g_device = nil;
 static id<MTLCommandQueue> g_queue = nil;
 static id<MTLComputePipelineState> g_sample_pipeline = nil;
+static id<MTLComputePipelineState> g_sum_pipeline = nil;
 static CVMetalTextureCacheRef g_cache = NULL;
 static CVMetalBufferCacheRef g_buffer_cache = NULL;
 
@@ -699,6 +700,111 @@ static PyObject *sample_luma_gpu(PyObject *self, PyObject *arg) {
     return result;
 }
 
+
+static PyObject *sum_luma_gpu(PyObject *self, PyObject *arg) {
+    unsigned long long raw = PyLong_AsUnsignedLongLong(arg);
+    if (PyErr_Occurred()) {
+        return NULL;
+    }
+    CVPixelBufferRef pb = (CVPixelBufferRef)(uintptr_t)raw;
+    if (pb == NULL) {
+        PyErr_SetString(PyExc_ValueError, "null CVPixelBufferRef");
+        return NULL;
+    }
+    if (g_cache == NULL || g_queue == nil || g_sum_pipeline == nil) {
+        PyErr_SetString(PyExc_RuntimeError, "Metal reduction pipeline unavailable");
+        return NULL;
+    }
+
+    size_t planes = CVPixelBufferGetPlaneCount(pb);
+    if (planes < 2) {
+        PyErr_SetString(PyExc_ValueError, "expected bi-planar VideoToolbox frame");
+        return NULL;
+    }
+
+    size_t width = CVPixelBufferGetWidthOfPlane(pb, 0);
+    size_t height = CVPixelBufferGetHeightOfPlane(pb, 0);
+    if (width == 0 || height == 0) {
+        PyErr_SetString(PyExc_ValueError, "empty luma plane");
+        return NULL;
+    }
+
+    unsigned long long max_sum =
+        (unsigned long long)width * (unsigned long long)height * 255ULL;
+    if (max_sum > 0xffffffffULL) {
+        PyErr_SetString(PyExc_OverflowError, "luma sum exceeds uint32 reduction range");
+        return NULL;
+    }
+
+    CVMetalTextureRef y_ref = NULL;
+    CVReturn r = CVMetalTextureCacheCreateTextureFromImage(
+        kCFAllocatorDefault,
+        g_cache,
+        pb,
+        NULL,
+        MTLPixelFormatR8Unorm,
+        width,
+        height,
+        0,
+        &y_ref);
+    if (r != kCVReturnSuccess || y_ref == NULL) {
+        if (y_ref) CFRelease(y_ref);
+        PyErr_Format(
+            PyExc_RuntimeError,
+            "CVMetalTextureCacheCreateTextureFromImage failed: %d",
+            (int)r);
+        return NULL;
+    }
+
+    id<MTLTexture> texture = CVMetalTextureGetTexture(y_ref);
+    if (texture == nil) {
+        CFRelease(y_ref);
+        PyErr_SetString(PyExc_RuntimeError, "Metal luma texture missing");
+        return NULL;
+    }
+
+    id<MTLBuffer> out_buffer =
+        [g_device newBufferWithLength:sizeof(uint32_t)
+                              options:MTLResourceStorageModeShared];
+    if (out_buffer == nil || out_buffer.contents == NULL) {
+        CFRelease(y_ref);
+        PyErr_SetString(PyExc_MemoryError, "failed to allocate Metal reduction buffer");
+        return NULL;
+    }
+    *((uint32_t *)out_buffer.contents) = 0;
+
+    id<MTLCommandBuffer> command = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    if (command == nil || encoder == nil) {
+        CFRelease(y_ref);
+        PyErr_SetString(PyExc_RuntimeError, "failed to create Metal reduction encoder");
+        return NULL;
+    }
+
+    [encoder setComputePipelineState:g_sum_pipeline];
+    [encoder setTexture:texture atIndex:0];
+    [encoder setBuffer:out_buffer offset:0 atIndex:0];
+
+    const NSUInteger tg = 256;
+    const NSUInteger total = width * height;
+    [encoder dispatchThreads:MTLSizeMake(total, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    [encoder endEncoding];
+    [command commit];
+    [command waitUntilCompleted];
+
+    if (command.status == MTLCommandBufferStatusError) {
+        NSString *msg = command.error.localizedDescription ?: @"unknown Metal error";
+        CFRelease(y_ref);
+        PyErr_Format(PyExc_RuntimeError, "Metal luma reduction failed: %s", [msg UTF8String]);
+        return NULL;
+    }
+
+    uint32_t sum = *((uint32_t *)out_buffer.contents);
+    CFRelease(y_ref);
+    return PyLong_FromUnsignedLong((unsigned long)sum);
+}
+
 static PyObject *buffer_cache_available(
     PyObject *self, PyObject *Py_UNUSED(ignored)) {
     if (g_buffer_cache != NULL) {
@@ -727,6 +833,8 @@ static PyMethodDef methods[] = {
      "Return IOSurface-backed plane offset/shape/stride metadata."},
     {"sample_luma_gpu", (PyCFunction)sample_luma_gpu, METH_O,
      "Sample deterministic luma pixels through the zero-copy Metal texture view."},
+    {"sum_luma_gpu", (PyCFunction)sum_luma_gpu, METH_O,
+     "Reduce the entire luma plane on Metal and return a scalar sum."},
     {"inspect_dlpack_capsule", (PyCFunction)inspect_dlpack_capsule, METH_O,
      "Inspect a legacy DLPack capsule without consuming it."},
     {"buffer_cache_available", (PyCFunction)buffer_cache_available, METH_NOARGS,
@@ -768,6 +876,27 @@ PyMODINIT_FUNC PyInit_puma_metal_bridge(void) {
              "uint tid [[thread_position_in_grid]]) {"
              "  float v = tex.read(coords[tid]).r;"
              "  out[tid] = (uchar)clamp(rint(v * 255.0f), 0.0f, 255.0f);"
+             "}\n"
+             "kernel void puma_sum_luma("
+             "texture2d<float, access::read> tex [[texture(0)]],"
+             "device atomic_uint *out [[buffer(0)]],"
+             "uint tid [[thread_position_in_grid]],"
+             "uint lid [[thread_index_in_threadgroup]]) {"
+             "  threadgroup uint scratch[256];"
+             "  uint total = tex.get_width() * tex.get_height();"
+             "  uint v = 0;"
+             "  if (tid < total) {"
+             "    uint x = tid % tex.get_width();"
+             "    uint y = tid / tex.get_width();"
+             "    v = (uint)clamp(rint(tex.read(uint2(x, y)).r * 255.0f), 0.0f, 255.0f);"
+             "  }"
+             "  scratch[lid] = v;"
+             "  threadgroup_barrier(mem_flags::mem_threadgroup);"
+             "  for (uint stride = 128; stride > 0; stride >>= 1) {"
+             "    if (lid < stride) scratch[lid] += scratch[lid + stride];"
+             "    threadgroup_barrier(mem_flags::mem_threadgroup);"
+             "  }"
+             "  if (lid == 0) atomic_fetch_add_explicit(out, scratch[0], memory_order_relaxed);"
              "}\n";
         NSError *library_error = nil;
         id<MTLLibrary> library =
@@ -788,6 +917,20 @@ PyMODINIT_FUNC PyInit_puma_metal_bridge(void) {
         if (g_sample_pipeline == nil) {
             const char *msg = pipeline_error.localizedDescription.UTF8String;
             PyErr_Format(PyExc_RuntimeError, "Metal sample pipeline failed: %s", msg ?: "unknown");
+            return NULL;
+        }
+
+        id<MTLFunction> sum_fn = [library newFunctionWithName:@"puma_sum_luma"];
+        if (sum_fn == nil) {
+            PyErr_SetString(PyExc_RuntimeError, "Metal luma reduction function missing");
+            return NULL;
+        }
+        NSError *sum_pipeline_error = nil;
+        g_sum_pipeline =
+            [g_device newComputePipelineStateWithFunction:sum_fn error:&sum_pipeline_error];
+        if (g_sum_pipeline == nil) {
+            const char *msg = sum_pipeline_error.localizedDescription.UTF8String;
+            PyErr_Format(PyExc_RuntimeError, "Metal luma reduction pipeline failed: %s", msg ?: "unknown");
             return NULL;
         }
 
